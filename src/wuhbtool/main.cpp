@@ -158,9 +158,11 @@ int main(int argc, char **argv) {
    addImageResource(metaFolder, "bootTvTex.tga.gz",  1280, 720, 24, options, "tv-image");
    addImageResource(metaFolder, "bootDrcTex.tga.gz",  854, 480, 24, options, "drc-image");
 	 
-   std::string bootSoundPath = options.get<std::string>("boot-sound");
-   auto bootSoundFile = OSFileEntry::fromPath(bootSoundPath.c_str(), "bootSound.btsnd");
-   metaFolder->addChild(bootSoundFile);
+   if (options.has("boot-sound")) {
+      std::string bootSoundPath = options.get<std::string>("boot-sound");
+      auto bootSoundFile = OSFileEntry::fromPath(bootSoundPath.c_str(), "bootSound.btsnd");
+      metaFolder->addChild(bootSoundFile);
+   }
 
    addFolderIfNotEmpty(root, codeFolder);
    addFolderIfNotEmpty(root, metaFolder);
