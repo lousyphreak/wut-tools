@@ -21,7 +21,55 @@ enum class ReadMode
    TEXT_WRAP,
    DATA,
    DATA_WRAP,
+   TLS,
 };
+
+static void
+writeHostImports(std::ofstream &out,
+                 const std::vector<std::string> &functions,
+                 const std::vector<std::string> &data,
+                 const std::vector<std::string> &tls)
+{
+   // The converter replaces these templates with the actual writable fixups.
+   out << ".section .data.wut_imports, \"aw\", @progbits\n.balign 4\n"
+       << ".global __wut_module_imports\n.type __wut_module_imports, @object\n"
+       << "__wut_module_imports:\n.long .Lwut_imports\n.Lwut_imports:\n.long "
+       << functions.size() + data.size() + tls.size() << "\n";
+   size_t index = 0;
+   for (const auto *names : { &functions, &data, &tls }) {
+      auto kind = names == &functions ? 0 : names == &data ? 1 : 2;
+      for (const auto &name : *names) {
+         if (kind == 0) out << ".long .Lwut_target_" << index << "\n";
+         else out << ".long 0\n";
+         out << ".long .Lwut_name_" << index << "\n.long 0\n.long " << kind << "\n";
+         ++index;
+      }
+   }
+   index = 0;
+   for (const auto *names : { &functions, &data, &tls }) {
+      auto kind = names == &functions ? 0 : names == &data ? 1 : 2;
+      for (const auto &name : *names) {
+         out << ".section .data.wut_imports, \"aw\", @progbits\n.balign 4\n";
+         if (kind == 0) out << ".Lwut_target_" << index << ":\n.long 0\n";
+         out << ".Lwut_name_" << index << ":\n.string \""
+             << (kind == 2 ? "__wut_tls_" : "") << name << "\"\n";
+         if (kind == 0) {
+            out << ".section .text.wut_import." << name << ", \"ax\", @progbits\n.balign 4\n"
+                << ".global " << name << "\n.type " << name << ", @function\n" << name << ":\n"
+                << "lis 12,.Lwut_target_" << index << "@ha\n"
+                << "lwz 12,.Lwut_target_" << index << "@l(12)\nmtctr 12\nbctr\n"
+                << ".size " << name << ",.-" << name << "\n";
+         } else {
+            out << ".section " << (kind == 2 ? ".tdata" : ".data") << ".wut_import." << name
+                << ", \"" << (kind == 2 ? "awT" : "aw") << "\", @progbits\n.balign 4\n"
+                << ".global " << name << "\n.type " << name << ", "
+                << (kind == 2 ? "@tls_object" : "@object") << "\n" << name << ":\n.long 0\n"
+                << ".size " << name << ",4\n";
+         }
+         ++index;
+      }
+   }
+}
 
 static void
 writeExports(std::ofstream &out,
@@ -100,11 +148,13 @@ int
 main(int argc, char **argv)
 {
    std::string moduleName;
-   std::vector<std::string> funcExports, dataExports;
+   std::vector<std::string> funcExports, dataExports, tlsExports;
    ReadMode readMode = ReadMode::INVALID;
+   bool host = argc > 1 && std::string(argv[1]) == "--host";
+   if (host) { --argc; ++argv; }
 
    if (argc < 3) {
-      std::cout << argv[0] << " <exports.def> <output.S> [<output.ld>]" << std::endl;
+      std::cout << "rplimportgen [--host] <exports.def> <output.S> [<output.ld>]" << std::endl;
       return 0;
    }
 
@@ -143,6 +193,8 @@ main(int argc, char **argv)
                readMode = ReadMode::DATA;
             } else if (line.substr(1) == "DATA_WRAP") {
                readMode = ReadMode::DATA_WRAP;
+            } else if (host && line.substr(1) == "TLS") {
+               readMode = ReadMode::TLS;
             } else if (line.substr(1, 4) == "NAME") {
                moduleName = line.substr(6);
             } else {
@@ -153,18 +205,25 @@ main(int argc, char **argv)
          }
 
          if (readMode == ReadMode::TEXT) {
-            funcExports.push_back(line);
+            funcExports.push_back(host && line == "atexit" ? "__cxa_atexit" : line);
          } else if (readMode == ReadMode::TEXT_WRAP) {
             funcExports.push_back(std::string(RPLWRAP_PREFIX) + line);
          } else if (readMode == ReadMode::DATA) {
             dataExports.push_back(line);
          } else if (readMode == ReadMode::DATA_WRAP) {
             dataExports.push_back(std::string(RPLWRAP_PREFIX) + line);
+         } else if (readMode == ReadMode::TLS) {
+            tlsExports.push_back(line);
          } else {
             std::cout << "Unexpected section data" << std::endl;
             return -1;
          }
       }
+   }
+
+   if (host) {
+      std::sort(funcExports.begin(), funcExports.end());
+      funcExports.erase(std::unique(funcExports.begin(), funcExports.end()), funcExports.end());
    }
 
    {
@@ -176,11 +235,13 @@ main(int argc, char **argv)
          return -1;
       }
 
-      if (funcExports.size() > 0) {
+      if (host) {
+         writeHostImports(out, funcExports, dataExports, tlsExports);
+      } else if (funcExports.size() > 0) {
          writeExports(out, moduleName, false, funcExports);
       }
 
-      if (dataExports.size() > 0) {
+      if (!host && dataExports.size() > 0) {
          writeExports(out, moduleName, true, dataExports);
       }
    }
@@ -194,7 +255,7 @@ main(int argc, char **argv)
          return -1;
       }
 
-      writeLinkerScript(out, moduleName);
+      if (!host) writeLinkerScript(out, moduleName);
    }
 
    return 0;

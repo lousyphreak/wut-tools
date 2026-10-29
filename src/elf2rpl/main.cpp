@@ -241,18 +241,18 @@ generateFileInfoSection(ElfFile &file,
 
       if (section->header.addr >= CodeBaseAddress &&
           section->header.addr < DataBaseAddress) {
-         auto val = section->header.addr + section->header.size - CodeBaseAddress;
+         auto val = section->header.addr + size - CodeBaseAddress;
          if (val > info.textSize) {
             info.textSize = val;
          }
       } else if (section->header.addr >= DataBaseAddress &&
                  section->header.addr < LoadBaseAddress) {
-         auto val = section->header.addr + section->header.size - DataBaseAddress;
+         auto val = section->header.addr + size - DataBaseAddress;
          if (val > info.dataSize) {
             info.dataSize = val;
          }
       } else if (section->header.addr >= LoadBaseAddress) {
-         auto val = section->header.addr + section->header.size - LoadBaseAddress;
+         auto val = section->header.addr + size - LoadBaseAddress;
          if (val > info.loadSize) {
             info.loadSize = val;
          }
@@ -347,6 +347,196 @@ getSymbol(ElfFile::Section &section,
    return true;
 }
 
+
+static ElfFile::Section *
+getSectionAtAddress(ElfFile &file, uint32_t address)
+{
+   for (const auto &section : file.sections) {
+      if ((section->header.flags & elf::SHF_ALLOC) && address >= section->header.addr &&
+          address - section->header.addr < section->header.size) return section.get();
+   }
+   return nullptr;
+}
+
+// Turn the generator's templates into data-only bindings. Instructions remain
+// native relocations, and function-address expressions receive canonical targets.
+static bool
+fixHostImports(ElfFile &file)
+{
+   auto symbols = getSectionByType(file, elf::SHT_SYMTAB);
+   auto sectionIndex = [&](const ElfFile::Section *section) {
+      return static_cast<uint32_t>(std::find_if(file.sections.begin(), file.sections.end(),
+         [section](const auto &s) { return s.get() == section; }) - file.sections.begin());
+   };
+   auto symbolSectionIndex = sectionIndex(symbols);
+   auto findSymbol = [&](const std::string &name) -> uint32_t {
+      auto strings = file.sections[symbols->header.link]->data.data();
+      auto values = reinterpret_cast<const elf::Symbol *>(symbols->data.data());
+      for (uint32_t i = 1; i < symbols->data.size() / sizeof(elf::Symbol); ++i)
+         if (name == strings + values[i].name) return i;
+      return 0;
+   };
+   auto cellIndex = findSymbol("__wut_module_imports");
+   if (!cellIndex) return true;
+   elf::Symbol cell;
+   getSymbol(*symbols, cellIndex, cell);
+   if (!cell.shndx) return true; // Unresolved weak reference in a legacy CRT.
+   auto cellSection = file.sections[cell.shndx].get();
+   auto readWord = [&](uint32_t address) -> uint32_t {
+      auto section = getSectionAtAddress(file, address);
+      return *reinterpret_cast<const be_val<uint32_t> *>(section->data.data() + address - section->header.addr);
+   };
+   auto table = readWord(cell.value);
+   auto count = readWord(table);
+   struct Import { uint32_t target, name, addend, kind; };
+   std::map<uint32_t, Import> imports;
+   std::vector<Import> bindings;
+   for (uint32_t i = 0; i < count; ++i) {
+      auto address = table + 4 + i * 16;
+      Import entry { readWord(address), readWord(address + 4), 0, readWord(address + 12) };
+      auto section = getSectionAtAddress(file, entry.name);
+      std::string name = section->data.data() + entry.name - section->header.addr;
+      auto index = findSymbol(entry.kind == 2 ? name.substr(10) : name);
+      elf::Symbol symbol;
+      if (!index || !getSymbol(*symbols, index, symbol) || !symbol.shndx) continue;
+      imports.emplace(index, entry);
+      if (entry.kind == 0) bindings.push_back(entry);
+   }
+
+   elf::Symbol got = {};
+   auto gotIndex = findSymbol("_GLOBAL_OFFSET_TABLE_");
+   if (gotIndex) getSymbol(*symbols, gotIndex, got);
+   std::set<uint32_t> tlsDescriptors;
+   for (auto &section : file.sections) {
+      if (section->header.type != elf::SHT_RELA || section->header.link != symbolSectionIndex) continue;
+      auto rels = reinterpret_cast<elf::Rela *>(section->data.data());
+      auto size = section->data.size() / sizeof(elf::Rela);
+      for (size_t i = 0; i < size; ++i) {
+         auto &rel = rels[i];
+         if (rel.offset == cell.value) {
+            rel.info = 0u; // Replaced by the final table pointer below.
+            continue;
+         }
+         auto match = imports.find(rel.info >> 8);
+         if (match == imports.end()) continue;
+         auto entry = match->second;
+         auto type = rel.info & 0xff;
+         if (type == elf::R_PPC_NONE || type == elf::R_PPC_TLSGD ||
+             (entry.kind == 2 && (type == elf::R_PPC_DTPMOD32 || type == elf::R_PPC_DTPREL32))) {
+            rel.info = 0u;
+            continue;
+         }
+         if (entry.kind == 0 && (type == elf::R_PPC_REL24 || type == elf::R_PPC_PLTREL24 ||
+                                type == elf::R_PPC_LOCAL24PC)) continue;
+         if (entry.kind == 2 && type == elf::R_PPC_GOT_TLSGD16) {
+            auto target = file.sections[section->header.info].get();
+            auto immediate = reinterpret_cast<const be_val<int16_t> *>(
+               target->data.data() + rel.offset - target->header.addr);
+            entry.target = got.value + static_cast<int32_t>(*immediate);
+            if (!tlsDescriptors.insert(entry.target).second) {
+               rel.info = 0u;
+               continue;
+            }
+         } else if (entry.kind != 2 && type == elf::R_PPC_ADDR32) {
+            entry.target = rel.offset;
+         } else {
+            fmt::print("ERROR: Host import requires PIC data fixups (relocation {}).\n", type);
+            return false;
+         }
+         auto target = getSectionAtAddress(file, entry.target);
+         if (!target || !(target->header.flags & elf::SHF_WRITE) ||
+             (target->header.flags & elf::SHF_EXECINSTR) || entry.target >= LoadBaseAddress) {
+            fmt::print("ERROR: Host import fixup is not writable module data.\n");
+            return false;
+         }
+         entry.addend = rel.addend;
+         bindings.push_back(entry);
+         rel.info = 0u;
+      }
+   }
+
+   auto addSection = [&](const char *name, uint32_t type, uint32_t flags) {
+      auto section = std::make_unique<ElfFile::Section>();
+      section->header = {};
+      section->name = name;
+      auto &names = file.sections[file.header.shstrndx]->data;
+      section->header.name = static_cast<uint32_t>(names.size());
+      names.insert(names.end(), name, name + strlen(name) + 1);
+      section->header.type = type;
+      section->header.flags = flags;
+      section->header.addralign = 4u;
+      section->index = static_cast<uint32_t>(file.sections.size() - file.num_discarded_sections);
+      auto result = section.get();
+      file.sections.push_back(std::move(section));
+      return result;
+   };
+   uint32_t end = DataBaseAddress;
+   for (auto &section : file.sections) {
+      if (section->header.addr >= DataBaseAddress && section->header.addr < LoadBaseAddress)
+         end = std::max(end, static_cast<uint32_t>(section->header.addr + section->header.size));
+   }
+   auto outputIndex = static_cast<uint32_t>(file.sections.size());
+   auto output = addSection(".wut.imports", elf::SHT_PROGBITS, elf::SHF_ALLOC | elf::SHF_WRITE);
+   output->header.addr = align_up(end, 4u);
+   output->data.resize(4 + bindings.size() * 16);
+   output->header.size = static_cast<uint32_t>(output->data.size());
+   auto words = reinterpret_cast<be_val<uint32_t> *>(output->data.data());
+   words[0] = static_cast<uint32_t>(bindings.size());
+   auto addressSymbol = [&](uint32_t address) -> std::pair<uint32_t, uint32_t> {
+      auto section = getSectionAtAddress(file, address);
+      auto index = sectionIndex(section);
+      auto values = reinterpret_cast<const elf::Symbol *>(symbols->data.data());
+      for (uint32_t i = 1; i < symbols->data.size() / sizeof(elf::Symbol); ++i) {
+         if (values[i].shndx == index && (values[i].info & 15) == elf::STT_SECTION)
+            return { i, address - values[i].value };
+      }
+      auto name = "__wut_binding_section_" + std::to_string(index);
+      auto &strings = file.sections[symbols->header.link]->data;
+      elf::Symbol symbol = {};
+      symbol.name = static_cast<uint32_t>(strings.size());
+      strings.insert(strings.end(), name.begin(), name.end());
+      strings.push_back(0);
+      symbol.value = section->header.addr;
+      symbol.shndx = static_cast<uint16_t>(index);
+      symbol.info = static_cast<uint8_t>((elf::STB_GLOBAL << 4) | elf::STT_OBJECT);
+      auto symbolIndex = static_cast<uint32_t>(symbols->data.size() / sizeof(elf::Symbol));
+      auto bytes = reinterpret_cast<const char *>(&symbol);
+      symbols->data.insert(symbols->data.end(), bytes, bytes + sizeof(symbol));
+      return { symbolIndex, address - section->header.addr };
+   };
+   auto relocations = addSection(".rela.wut.imports", elf::SHT_RELA, 0);
+   relocations->header.link = symbolSectionIndex;
+   relocations->header.info = outputIndex;
+   relocations->header.entsize = sizeof(elf::Rela);
+   auto appendRelocation = [&](ElfFile::Section *destination, uint32_t offset, uint32_t address) {
+      auto target = addressSymbol(address);
+      elf::Rela relocation = {};
+      relocation.offset = offset;
+      relocation.info = (target.first << 8) | elf::R_PPC_ADDR32;
+      relocation.addend = target.second;
+      auto bytes = reinterpret_cast<const char *>(&relocation);
+      destination->data.insert(destination->data.end(), bytes, bytes + sizeof(relocation));
+      destination->header.size = static_cast<uint32_t>(destination->data.size());
+   };
+   for (size_t i = 0; i < bindings.size(); ++i) {
+      auto &entry = bindings[i];
+      words[1 + i * 4] = entry.target;
+      words[2 + i * 4] = entry.name;
+      words[3 + i * 4] = entry.addend;
+      words[4 + i * 4] = entry.kind;
+      appendRelocation(relocations, output->header.addr + 4 + i * 16, entry.target);
+      appendRelocation(relocations, output->header.addr + 8 + i * 16, entry.name);
+   }
+   auto pointerRelocations = addSection(".rela.wut.import_pointer", elf::SHT_RELA, 0);
+   pointerRelocations->header.link = symbolSectionIndex;
+   pointerRelocations->header.info = static_cast<uint32_t>(cell.shndx);
+   pointerRelocations->header.entsize = sizeof(elf::Rela);
+   appendRelocation(pointerRelocations, cell.value, output->header.addr);
+   *reinterpret_cast<be_val<uint32_t> *>(cellSection->data.data() + cell.value - cellSection->header.addr) = output->header.addr;
+   symbols->header.size = static_cast<uint32_t>(symbols->data.size());
+   file.sections[symbols->header.link]->header.size = static_cast<uint32_t>(file.sections[symbols->header.link]->data.size());
+   return true;
+}
 
 /**
  * Fix relocations.
@@ -770,6 +960,18 @@ fixLoaderVirtualAddresses(ElfFile &file)
       }
    }
 
+   // Symbol section indices must follow the same debug-section filtering as
+   // relocation targets and section links.
+   for (auto &section : file.sections) {
+      if (section->header.type != elf::SHT_SYMTAB) continue;
+      auto symbols = reinterpret_cast<elf::Symbol *>(section->data.data());
+      for (size_t i = 0; i < section->data.size() / sizeof(elf::Symbol); ++i) {
+         if (symbols[i].shndx >= file.sections.size()) continue;
+         auto index = file.sections[symbols[i].shndx]->index;
+         symbols[i].shndx = static_cast<uint16_t>(index == UINT32_MAX ? 0 : index);
+      }
+   }
+
    return true;
 }
 
@@ -1066,6 +1268,11 @@ int main(int argc, char **argv)
 
    if (!readElf(elf, src)) {
       fmt::print("ERROR: readElf failed.\n");
+      return -1;
+   }
+
+   if (!fixHostImports(elf)) {
+      fmt::print("ERROR: fixHostImports failed.\n");
       return -1;
    }
 
