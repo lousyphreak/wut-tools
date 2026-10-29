@@ -383,6 +383,28 @@ fixRelocations(ElfFile &file)
          auto type = info & 0xFF;
 
          switch (type) {
+         case elf::R_PPC_PLTREL24:
+            // GNU uses the addend to identify a PIC GOT, not a function offset.
+            rels[i].info = (index << 8) | elf::R_PPC_REL24;
+            rels[i].addend = 0u;
+            break;
+
+         case elf::R_PPC_LOCAL24PC:
+            rels[i].info = (index << 8) | elf::R_PPC_REL24;
+            break;
+
+         case elf::R_PPC_REL16_LO:
+            rels[i].info = (index << 8) | elf::R_PPC_GHS_REL16_LO;
+            break;
+
+         case elf::R_PPC_REL16_HI:
+            rels[i].info = (index << 8) | elf::R_PPC_GHS_REL16_HI;
+            break;
+
+         case elf::R_PPC_REL16_HA:
+            rels[i].info = (index << 8) | elf::R_PPC_GHS_REL16_HA;
+            break;
+
          case elf::R_PPC_NONE:
          case elf::R_PPC_ADDR32:
          case elf::R_PPC_ADDR16_LO:

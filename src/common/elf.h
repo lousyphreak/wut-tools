@@ -191,6 +191,10 @@ enum RelocationType : uint32_t // r_info & 0xff
    R_PPC_DIAB_RELSDA_LO = 183,
    R_PPC_DIAB_RELSDA_HI = 184,
    R_PPC_DIAB_RELSDA_HA = 185,
+   // GNU ELF input numbering overlaps the native GHS relocation numbers.
+   R_PPC_REL16_LO = 250,
+   R_PPC_REL16_HI = 251,
+   R_PPC_REL16_HA = 252,
    R_PPC_GHS_REL16_HA = 251,
    R_PPC_GHS_REL16_HI = 252,
    R_PPC_GHS_REL16_LO = 253,

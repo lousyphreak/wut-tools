@@ -64,7 +64,7 @@ writeExports(std::ofstream &out,
    out << ".align 4" << std::endl;
    out << std::endl;
 
-   out << ".long " << exports.size() << std::endl;
+   out << ".long " << std::dec << exports.size() << std::endl;
    out << ".long 0x" << std::hex << signature << std::endl;
    out << std::endl;
 
