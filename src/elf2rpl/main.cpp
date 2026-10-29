@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <math.h>
+#include <map>
 #include <zlib.h>
 
 constexpr auto DeflateMinSectionSize = 0x18u;
@@ -118,17 +119,20 @@ readElf(ElfFile &file, const std::string &filename)
       in.read(reinterpret_cast<char *>(&section.header), sizeof(elf::SectionHeader));
       section.index = 0;
 
-      if (!section.header.size || section.header.type == elf::SHT_NOBITS) {
-         continue;
-      }
-
       if (section.header.addr >= DataBaseAddress && section.header.addr < LoadBaseAddress) {
+         // GNU's TLS GOT includes an unused branch stub.  It must not turn
+         // the containing data section into an RPL executable section.
+         section.header.flags &= ~elf::SHF_EXECINSTR;
          section.header.flags |= elf::SHF_WRITE;
       }
 
       if (section.header.flags & elf::SHF_TLS) {
          section.header.flags &= ~elf::SHF_TLS;
          section.header.flags |= elf::SHF_RPL_TLS;
+      }
+
+      if (!section.header.size || section.header.type == elf::SHT_NOBITS) {
+         continue;
       }
 
       auto pos = in.tellg();
@@ -354,6 +358,7 @@ fixRelocations(ElfFile &file)
 {
    std::set<unsigned int> unsupportedTypes;
    auto result = true;
+   std::map<std::pair<uint32_t, uint32_t>, std::vector<elf::Rela>> tlsRelocations;
 
    for (auto &section : file.sections) {
       std::vector<elf::Rela> newRelocations;
@@ -425,50 +430,52 @@ fixRelocations(ElfFile &file)
             break;
          }
 
-         /*
-          * Convert R_PPC_GOT_TLSGD16/R_PPC_TLSGD into R_PPC_DTPMOD32/R_PPC_DTPREL32
-          */
+         // The call marker is not a runtime relocation.  Derive both words
+         // from the descriptor reference; instruction scheduling can separate
+         // that reference from the call.
          case elf::R_PPC_TLSGD:
+            rels[i].info = 0u;
+            break;
+
          case elf::R_PPC_GOT_TLSGD16: {
-            uint32_t gotAddr = 0;
-            bool gotFound = false;
             auto strTab = file.sections[symbolSection->header.link]->data.data();
-            for (int j = 0; j < symbolSection->data.size() / sizeof(elf::Symbol); j++) {
-               elf::Symbol symbol;
-               getSymbol(*symbolSection, j, symbol);
-               if (!strcmp(strTab + symbol.name, "_GLOBAL_OFFSET_TABLE_")) {
+            elf::Symbol got;
+            bool gotFound = false;
+            for (auto j = 0u; j < symbolSection->data.size() / sizeof(elf::Symbol); ++j) {
+               getSymbol(*symbolSection, j, got);
+               if (!strcmp(strTab + got.name, "_GLOBAL_OFFSET_TABLE_")) {
                   gotFound = true;
-                  gotAddr = symbol.value;
-                  if (targetSection->name != file.sections[symbol.shndx]->name) {
-                     fmt::print("ERROR: \"_GLOBAL_OFFSET_TABLE_\" found in section \"{}\" instead of \"{}\", "
-                                "cannot fix a R_PPC_GOT_TLSGD16 relocation\n",
-                                file.sections[symbol.shndx]->name, targetSection->name);
-                     result = false;
-                  }
                   break;
                }
             }
 
             if (!gotFound) {
-               fmt::print("ERROR: Could not find symbol \"_GLOBAL_OFFSET_TABLE_\" for fixing a R_PPC_GOT_TLSGD16 relocation\n");
+               fmt::print("ERROR: Could not find _GLOBAL_OFFSET_TABLE_ for TLS descriptor relocation\n");
                result = false;
                break;
             }
 
-            /* tls_index is stored in GOT as 8 bytes (DTPMOD32 + DTPREL32)
-             * GOT_TLSGD16 points to the offset of tls_index in GOT
-             * for R_PPC_TLSGD, the offset is in the previous instruction
-             */
-            be_val<int16_t> *tlsIndexOffset = (be_val<int16_t> *)(targetSection->data.data() + offset - targetSection->header.addr);
-
-            if (type == elf::R_PPC_GOT_TLSGD16) {
-               rels[i].info = (index << 8) | elf::R_PPC_DTPMOD32;
-               rels[i].offset = gotAddr + *tlsIndexOffset;
-            } else {
-               tlsIndexOffset--;
-               rels[i].info = (index << 8) | elf::R_PPC_DTPREL32;
-               rels[i].offset = gotAddr + *tlsIndexOffset + 4;
+            auto immediate = reinterpret_cast<const be_val<int16_t> *>(
+               targetSection->data.data() + offset - targetSection->header.addr);
+            auto descriptor = got.value + static_cast<int32_t>(*immediate);
+            auto &output = tlsRelocations[{ got.shndx, section->header.link }];
+            if (std::any_of(output.begin(), output.end(), [descriptor](const elf::Rela &relocation) {
+               return relocation.offset == descriptor;
+            })) {
+               rels[i].info = 0u;
+               break;
             }
+            elf::Rela moduleRelocation;
+            moduleRelocation.offset = descriptor;
+            moduleRelocation.info = (index << 8) | elf::R_PPC_DTPMOD32;
+            moduleRelocation.addend = 0u;
+            output.push_back(moduleRelocation);
+            elf::Rela offsetRelocation;
+            offsetRelocation.offset = descriptor + 4;
+            offsetRelocation.info = (index << 8) | elf::R_PPC_DTPREL32;
+            offsetRelocation.addend = addend;
+            output.push_back(offsetRelocation);
+            rels[i].info = 0u;
             break;
          }
 
@@ -481,9 +488,51 @@ fixRelocations(ElfFile &file)
          }
       }
 
+      auto end = std::remove_if(rels, rels + numRels, [](const elf::Rela &relocation) {
+         return (relocation.info & 0xff) == elf::R_PPC_NONE;
+      });
+      section->data.resize(reinterpret_cast<char *>(end) - section->data.data());
+      section->header.size = static_cast<uint32_t>(section->data.size());
+
       section->data.insert(section->data.end(),
                            reinterpret_cast<char *>(newRelocations.data()),
                            reinterpret_cast<char *>(newRelocations.data() + newRelocations.size()));
+   }
+
+   // Descriptor relocations belong to their data section, even when the
+   // compiler's TLS references were in a different code section.
+   for (auto &entry : tlsRelocations) {
+      auto target = entry.first.first;
+      auto symbols = entry.first.second;
+      ElfFile::Section *destination = nullptr;
+      for (auto &section : file.sections) {
+         if (section->header.type == elf::SHT_RELA &&
+             section->header.info == target && section->header.link == symbols) {
+            destination = section.get();
+            break;
+         }
+      }
+      if (!destination) {
+         auto section = std::make_unique<ElfFile::Section>();
+         section->header = {};
+         section->name = ".rela" + file.sections[target]->name;
+         auto &names = file.sections[file.header.shstrndx]->data;
+         section->header.name = static_cast<uint32_t>(names.size());
+         names.insert(names.end(), section->name.c_str(), section->name.c_str() + section->name.size() + 1);
+         section->header.type = elf::SHT_RELA;
+         section->header.link = symbols;
+         section->header.info = target;
+         section->header.addralign = 4u;
+         section->header.entsize = static_cast<uint32_t>(sizeof(elf::Rela));
+         section->index = static_cast<uint32_t>(file.sections.size() - file.num_discarded_sections);
+         destination = section.get();
+         file.sections.push_back(std::move(section));
+      }
+      auto &relocations = entry.second;
+      destination->data.insert(destination->data.end(),
+         reinterpret_cast<const char *>(relocations.data()),
+         reinterpret_cast<const char *>(relocations.data() + relocations.size()));
+      destination->header.size = static_cast<uint32_t>(destination->data.size());
    }
 
    return result && unsupportedTypes.size() == 0;
